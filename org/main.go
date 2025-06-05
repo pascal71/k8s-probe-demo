@@ -1,0 +1,531 @@
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"html/template"
+	"log"
+	"net"
+	"net/http"
+	"os"
+	"sync"
+	"time"
+)
+
+type ProbeStatus struct {
+	Started bool `json:"started"`
+	Live    bool `json:"live"`
+	Ready   bool `json:"ready"`
+}
+
+type AppInfo struct {
+	PodName      string        `json:"podName"`
+	PodIP        string        `json:"podIP"`
+	NodeHostname string        `json:"nodeHostname"`
+	ContainerAge time.Duration `json:"containerAge"`
+	StartTime    time.Time     `json:"startTime"`
+	ProbeStatus  ProbeStatus   `json:"probeStatus"`
+}
+
+var (
+	appInfo        AppInfo
+	probeStatus    ProbeStatus
+	probeMutex     sync.RWMutex
+	startTime      = time.Now()
+	readinessTimer *time.Timer
+)
+
+const htmlTemplate = `
+<!DOCTYPE html>
+<html>
+<head>
+    <title>K8s Probe Demo</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 50px auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            background-color: white;
+            border-radius: 8px;
+            padding: 30px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #333;
+            border-bottom: 2px solid #4CAF50;
+            padding-bottom: 10px;
+        }
+        .info-section {
+            margin: 20px 0;
+            padding: 15px;
+            background-color: #f9f9f9;
+            border-radius: 4px;
+        }
+        .info-item {
+            margin: 10px 0;
+            font-size: 16px;
+        }
+        .label {
+            font-weight: bold;
+            color: #555;
+            display: inline-block;
+            width: 150px;
+        }
+        .pod-name {
+            font-weight: bold;
+            color: #2196F3;
+        }
+        .probe-section {
+            margin-top: 30px;
+        }
+        .switch-container {
+            display: flex;
+            align-items: center;
+            margin: 20px 0;
+            padding: 15px;
+            background-color: #f0f0f0;
+            border-radius: 4px;
+        }
+        .switch-label {
+            flex: 1;
+            font-size: 16px;
+            font-weight: bold;
+            color: #333;
+        }
+        .switch {
+            position: relative;
+            display: inline-block;
+            width: 60px;
+            height: 34px;
+        }
+        .switch input {
+            opacity: 0;
+            width: 0;
+            height: 0;
+        }
+        .slider {
+            position: absolute;
+            cursor: pointer;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background-color: #ccc;
+            transition: .4s;
+            border-radius: 34px;
+        }
+        .slider:before {
+            position: absolute;
+            content: "";
+            height: 26px;
+            width: 26px;
+            left: 4px;
+            bottom: 4px;
+            background-color: white;
+            transition: .4s;
+            border-radius: 50%;
+        }
+        input:checked + .slider {
+            background-color: #4CAF50;
+        }
+        input:checked + .slider:before {
+            transform: translateX(26px);
+        }
+        .status-indicator {
+            display: inline-block;
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            margin-left: 10px;
+        }
+        .status-on {
+            background-color: #4CAF50;
+        }
+        .status-off {
+            background-color: #f44336;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Kubernetes Probe Demo Application</h1>
+        
+        <div class="info-section">
+            <h2>Pod Information</h2>
+            <div class="info-item">
+                <span class="label">Pod Name:</span>
+                <span id="pod-name" class="pod-name">{{.PodName}}</span>
+            </div>
+            <div class="info-item">
+                <span class="label">Pod IP:</span>
+                <span id="pod-ip">{{.PodIP}}</span>
+            </div>
+            <div class="info-item">
+                <span class="label">Node Hostname:</span>
+                <span id="node-hostname">{{.NodeHostname}}</span>
+            </div>
+            <div class="info-item">
+                <span class="label">Container Age:</span>
+                <span id="container-age">{{.ContainerAge}}</span>
+            </div>
+        </div>
+
+        <div class="probe-section">
+            <h2>Probe Controls</h2>
+            
+            <div class="switch-container">
+                <span class="switch-label">
+                    Startup Probe (App Started)
+                    <span class="status-indicator {{if .ProbeStatus.Started}}status-on{{else}}status-off{{end}}"></span>
+                </span>
+                <label class="switch">
+                    <input type="checkbox" id="startup-switch" {{if .ProbeStatus.Started}}checked{{end}} onchange="toggleProbe('startup')">
+                    <span class="slider"></span>
+                </label>
+            </div>
+
+            <div class="switch-container">
+                <span class="switch-label">
+                    Liveness Probe (App is Live)
+                    <span class="status-indicator {{if .ProbeStatus.Live}}status-on{{else}}status-off{{end}}"></span>
+                </span>
+                <label class="switch">
+                    <input type="checkbox" id="liveness-switch" {{if .ProbeStatus.Live}}checked{{end}} onchange="toggleProbe('liveness')">
+                    <span class="slider"></span>
+                </label>
+            </div>
+
+            <div class="switch-container">
+                <span class="switch-label">
+                    Readiness Probe (Ready for Traffic)
+                    <span class="status-indicator {{if .ProbeStatus.Ready}}status-on{{else}}status-off{{end}}"></span>
+                </span>
+                <label class="switch">
+                    <input type="checkbox" id="readiness-switch" {{if .ProbeStatus.Ready}}checked{{end}} onchange="toggleProbe('readiness')">
+                    <span class="slider"></span>
+                </label>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let currentPodName = '{{.PodName}}';
+        
+        function toggleProbe(probeType) {
+            fetch('/toggle/' + probeType, { method: 'POST' })
+                .then(response => response.json())
+                .then(data => {
+                    console.log('Probe toggled:', data);
+                    // Update the UI to reflect the new state
+                    updateProbeStatus();
+                })
+                .catch(error => console.error('Error:', error));
+        }
+
+        function updateAge() {
+            fetch('/api/info')
+                .then(response => response.json())
+                .then(data => {
+                    document.getElementById('container-age').textContent = formatDuration(data.containerAge);
+                    
+                    // Check if pod changed
+                    if (data.podName !== currentPodName) {
+                        currentPodName = data.podName;
+                        document.getElementById('pod-name').textContent = data.podName;
+                        // Flash the pod name to indicate change
+                        const podNameElement = document.getElementById('pod-name');
+                        podNameElement.style.backgroundColor = '#ffeb3b';
+                        setTimeout(() => {
+                            podNameElement.style.backgroundColor = 'transparent';
+                        }, 1000);
+                    }
+                })
+                .catch(error => console.error('Error:', error));
+        }
+
+        function updateProbeStatus() {
+            fetch('/api/info')
+                .then(response => response.json())
+                .then(data => {
+                    // Update startup probe
+                    const startupSwitch = document.getElementById('startup-switch');
+                    const startupIndicator = startupSwitch.parentElement.parentElement.querySelector('.status-indicator');
+                    startupSwitch.checked = data.probeStatus.started;
+                    startupIndicator.className = 'status-indicator ' + (data.probeStatus.started ? 'status-on' : 'status-off');
+
+                    // Update liveness probe
+                    const livenessSwitch = document.getElementById('liveness-switch');
+                    const livenessIndicator = livenessSwitch.parentElement.parentElement.querySelector('.status-indicator');
+                    livenessSwitch.checked = data.probeStatus.live;
+                    livenessIndicator.className = 'status-indicator ' + (data.probeStatus.live ? 'status-on' : 'status-off');
+
+                    // Update readiness probe
+                    const readinessSwitch = document.getElementById('readiness-switch');
+                    const readinessIndicator = readinessSwitch.parentElement.parentElement.querySelector('.status-indicator');
+                    readinessSwitch.checked = data.probeStatus.ready;
+                    readinessIndicator.className = 'status-indicator ' + (data.probeStatus.ready ? 'status-on' : 'status-off');
+                })
+                .catch(error => console.error('Error:', error));
+        }
+
+        function formatDuration(nanoseconds) {
+            const seconds = Math.floor(nanoseconds / 1000000000);
+            const minutes = Math.floor(seconds / 60);
+            const hours = Math.floor(minutes / 60);
+            const days = Math.floor(hours / 24);
+
+            if (days > 0) {
+                return days + 'd ' + (hours % 24) + 'h ' + (minutes % 60) + 'm ' + (seconds % 60) + 's';
+            } else if (hours > 0) {
+                return hours + 'h ' + (minutes % 60) + 'm ' + (seconds % 60) + 's';
+            } else if (minutes > 0) {
+                return minutes + 'm ' + (seconds % 60) + 's';
+            } else {
+                return seconds + 's';
+            }
+        }
+
+        // Update age every second
+        setInterval(updateAge, 1000);
+        
+        // Update probe status every 2 seconds
+        setInterval(updateProbeStatus, 2000);
+    </script>
+</body>
+</html>
+`
+
+func init() {
+	// Initialize probe status
+	probeStatus = ProbeStatus{
+		Started: true,
+		Live:    true,
+		Ready:   true,
+	}
+
+	// Get Pod Name
+	podName := os.Getenv("POD_NAME")
+	if podName == "" {
+		hostname, err := os.Hostname()
+		if err == nil {
+			podName = hostname
+		} else {
+			podName = "Unknown"
+		}
+	}
+
+	// Get Pod IP
+	podIP := os.Getenv("POD_IP")
+	if podIP == "" {
+		// If not set by K8s, try to get local IP
+		addrs, err := net.InterfaceAddrs()
+		if err == nil {
+			for _, addr := range addrs {
+				if ipnet, ok := addr.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
+					if ipnet.IP.To4() != nil {
+						podIP = ipnet.IP.String()
+						break
+					}
+				}
+			}
+		}
+	}
+	if podIP == "" {
+		podIP = "Unknown"
+	}
+
+	// Get Node Hostname
+	nodeHostname := os.Getenv("NODE_NAME")
+	if nodeHostname == "" {
+		hostname, err := os.Hostname()
+		if err == nil {
+			nodeHostname = hostname
+		} else {
+			nodeHostname = "Unknown"
+		}
+	}
+
+	appInfo = AppInfo{
+		PodName:      podName,
+		PodIP:        podIP,
+		NodeHostname: nodeHostname,
+		StartTime:    startTime,
+		ProbeStatus:  probeStatus,
+	}
+}
+
+func main() {
+	// Main page handler
+	http.HandleFunc("/", handleMainPage)
+
+	// API endpoints
+	http.HandleFunc("/api/info", handleAPIInfo)
+	http.HandleFunc("/toggle/startup", handleToggleStartup)
+	http.HandleFunc("/toggle/liveness", handleToggleLiveness)
+	http.HandleFunc("/toggle/readiness", handleToggleReadiness)
+
+	// Probe endpoints
+	http.HandleFunc("/startup", handleStartupProbe)
+	http.HandleFunc("/liveness", handleLivenessProbe)
+	http.HandleFunc("/readiness", handleReadinessProbe)
+
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+
+	log.Printf("Server starting on port %s", port)
+	log.Fatal(http.ListenAndServe(":"+port, nil))
+}
+
+func handleMainPage(w http.ResponseWriter, r *http.Request) {
+	probeMutex.RLock()
+	defer probeMutex.RUnlock()
+
+	tmpl, err := template.New("index").Parse(htmlTemplate)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	data := AppInfo{
+		PodName:      appInfo.PodName,
+		PodIP:        appInfo.PodIP,
+		NodeHostname: appInfo.NodeHostname,
+		ContainerAge: time.Since(startTime),
+		StartTime:    appInfo.StartTime,
+		ProbeStatus:  probeStatus,
+	}
+
+	err = tmpl.Execute(w, data)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+}
+
+func handleAPIInfo(w http.ResponseWriter, r *http.Request) {
+	probeMutex.RLock()
+	defer probeMutex.RUnlock()
+
+	data := AppInfo{
+		PodName:      appInfo.PodName,
+		PodIP:        appInfo.PodIP,
+		NodeHostname: appInfo.NodeHostname,
+		ContainerAge: time.Since(startTime),
+		StartTime:    appInfo.StartTime,
+		ProbeStatus:  probeStatus,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(data)
+}
+
+func handleToggleStartup(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	probeMutex.Lock()
+	probeStatus.Started = !probeStatus.Started
+	probeMutex.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]bool{"started": probeStatus.Started})
+}
+
+func handleToggleLiveness(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	probeMutex.Lock()
+	probeStatus.Live = !probeStatus.Live
+	probeMutex.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]bool{"live": probeStatus.Live})
+}
+
+func handleToggleReadiness(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	probeMutex.Lock()
+	probeStatus.Ready = !probeStatus.Ready
+
+	// If switching to off (false), set a timer to turn it back on after 30 seconds
+	if !probeStatus.Ready {
+		// Cancel any existing timer
+		if readinessTimer != nil {
+			readinessTimer.Stop()
+		}
+
+		// Set new timer for 30 seconds
+		readinessTimer = time.AfterFunc(30*time.Second, func() {
+			probeMutex.Lock()
+			probeStatus.Ready = true
+			probeMutex.Unlock()
+			log.Println("Readiness probe automatically restored to ready state after 30 seconds")
+		})
+	} else {
+		// If manually turning on, cancel any pending timer
+		if readinessTimer != nil {
+			readinessTimer.Stop()
+			readinessTimer = nil
+		}
+	}
+
+	currentStatus := probeStatus.Ready
+	probeMutex.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]bool{"ready": currentStatus})
+}
+
+func handleStartupProbe(w http.ResponseWriter, r *http.Request) {
+	probeMutex.RLock()
+	defer probeMutex.RUnlock()
+
+	if probeStatus.Started {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, "OK - Startup probe passed")
+	} else {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		fmt.Fprintf(w, "FAIL - Application not started")
+	}
+}
+
+func handleLivenessProbe(w http.ResponseWriter, r *http.Request) {
+	probeMutex.RLock()
+	defer probeMutex.RUnlock()
+
+	if probeStatus.Live {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, "OK - Liveness probe passed")
+	} else {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		fmt.Fprintf(w, "FAIL - Application not live")
+	}
+}
+
+func handleReadinessProbe(w http.ResponseWriter, r *http.Request) {
+	probeMutex.RLock()
+	defer probeMutex.RUnlock()
+
+	if probeStatus.Ready {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, "OK - Readiness probe passed")
+	} else {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		fmt.Fprintf(w, "FAIL - Application not ready")
+	}
+}
