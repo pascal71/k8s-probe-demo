@@ -26,6 +26,8 @@ type AppInfo struct {
 	ContainerAge time.Duration `json:"containerAge"`
 	StartTime    time.Time     `json:"startTime"`
 	ProbeStatus  ProbeStatus   `json:"probeStatus"`
+	StartupDelay int           `json:"startupDelay"`
+	StartupReady time.Time     `json:"startupReady"`
 }
 
 var (
@@ -35,6 +37,8 @@ var (
 	startTime      = time.Now()
 	readinessTimer *time.Timer
 	livenessTimer  *time.Timer
+	startupDelay   int
+	startupReady   time.Time
 )
 
 const htmlTemplate = `
@@ -174,6 +178,10 @@ const htmlTemplate = `
                 <span class="label">Container Age:</span>
                 <span id="container-age">{{.ContainerAge}}</span>
             </div>
+            <div class="info-item" id="startup-delay-info" style="display: none;">
+                <span class="label">Startup Delay:</span>
+                <span id="startup-delay" style="color: #ff9800; font-weight: bold;"></span>
+            </div>
         </div>
 
         <div class="probe-section">
@@ -292,6 +300,24 @@ const htmlTemplate = `
                 .then(data => {
                     document.getElementById('container-age').textContent = formatDuration(data.containerAge);
                     
+                    // Show startup delay info if still in startup phase
+                    const now = new Date().getTime();
+                    const startupReadyTime = new Date(data.startupReady).getTime();
+                    const remainingStartupTime = Math.max(0, Math.ceil((startupReadyTime - now) / 1000));
+                    
+                    const startupDelayInfo = document.getElementById('startup-delay-info');
+                    const startupDelayElement = document.getElementById('startup-delay');
+                    
+                    if (remainingStartupTime > 0) {
+                        startupDelayInfo.style.display = 'block';
+                        startupDelayElement.textContent = 'Starting in ' + remainingStartupTime + 's (Total: ' + data.startupDelay + 's)';
+                    } else if (!data.probeStatus.started) {
+                        startupDelayInfo.style.display = 'block';
+                        startupDelayElement.textContent = 'Starting up...';
+                    } else {
+                        startupDelayInfo.style.display = 'none';
+                    }
+                    
                     // Check if pod changed
                     if (data.podName !== currentPodName) {
                         currentPodName = data.podName;
@@ -360,12 +386,30 @@ const htmlTemplate = `
 `
 
 func init() {
-	// Initialize probe status
+	// Seed random number generator
+	rand.Seed(time.Now().UnixNano())
+
+	// Generate random startup delay between 10 and 20 seconds
+	startupDelay = rand.Intn(11) + 10 // 10 to 20 seconds
+	startupReady = startTime.Add(time.Duration(startupDelay) * time.Second)
+
+	log.Printf("Startup probe will become ready after %d seconds", startupDelay)
+
+	// Initialize probe status - startup false until delay passes
 	probeStatus = ProbeStatus{
-		Started: true,
+		Started: false,
 		Live:    true,
 		Ready:   true,
 	}
+
+	// Set timer to enable startup probe after delay
+	go func() {
+		time.Sleep(time.Duration(startupDelay) * time.Second)
+		probeMutex.Lock()
+		probeStatus.Started = true
+		probeMutex.Unlock()
+		log.Printf("Startup probe is now ready after %d seconds", startupDelay)
+	}()
 
 	// Get Pod Name
 	podName := os.Getenv("POD_NAME")
@@ -483,6 +527,8 @@ func handleAPIInfo(w http.ResponseWriter, r *http.Request) {
 		ContainerAge: time.Since(startTime),
 		StartTime:    appInfo.StartTime,
 		ProbeStatus:  probeStatus,
+		StartupDelay: startupDelay,
+		StartupReady: startupReady,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -607,10 +653,14 @@ func handleStartupProbe(w http.ResponseWriter, r *http.Request) {
 
 	if probeStatus.Started {
 		w.WriteHeader(http.StatusOK)
-		fmt.Fprintf(w, "OK - Startup probe passed")
+		fmt.Fprintf(w, "OK - Startup probe passed (took %d seconds to start)", startupDelay)
 	} else {
+		remainingTime := int(time.Until(startupReady).Seconds())
+		if remainingTime < 0 {
+			remainingTime = 0
+		}
 		w.WriteHeader(http.StatusServiceUnavailable)
-		fmt.Fprintf(w, "FAIL - Application not started")
+		fmt.Fprintf(w, "FAIL - Application starting... (%d seconds remaining of %d second startup)", remainingTime, startupDelay)
 	}
 }
 
